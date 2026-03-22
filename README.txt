@@ -47,6 +47,13 @@ HOW TO USE - STEP BY STEP
 STEP 1: Choose Your File Type
   At the top of the window, select from the dropdown: XML/Word, Data TXT,
   or IDFX. The interface will switch to show the appropriate queue and options.
+  If the window is short or narrow, use the vertical and horizontal scrollbars,
+  mouse wheel, or laptop touchpad to reach all settings and buttons. Vertical
+  wheel or two-finger vertical scroll moves up/down; hold Shift while scrolling
+  (or use the horizontal scrollbar) to move left/right when the content is wider
+  than the window. On Linux, horizontal trackpads may also use mouse buttons 6/7.
+  Scrolling uses smooth pixel-based motion. Wheel or touchpad over list boxes and
+  text fields still scrolls those controls as usual.
 
 STEP 2: Add Files to the Queue
   Click "Add [type] to Queue"
@@ -99,6 +106,46 @@ Show Caret
   What it does: When checked, displays a blinking cursor at the end of the
   typed text. When unchecked, no cursor is shown.
   How to use: Check to show cursor, uncheck to hide it.
+
+Hide backspace edits (video shows only surviving text; no deleted keystrokes)
+  What it does: Depends on file type:
+
+  • IDFX: For each contiguous run of backspace keys, the program removes
+    those backspaces and also removes the same number of text-producing
+    keystrokes (letters, space, enter) that occur immediately *before* that
+    run in time. It repeats until no backspaces remain. Example: S, A, two
+    backspaces, then F-A-C-E becomes F-A-C-E (the two backspaces and the two
+    keys S and A before them are dropped from the animation). Video length
+    uses only time between surviving keystrokes (no long pause where deleted
+    typing used to be).
+
+  • Data TXT: Uses a stack model (each backspace removes the preceding
+    text-producing key from the timeline). Video length uses only gaps
+    between surviving keystrokes.
+
+  • XML/Word (non-uniform): Stack model like Data TXT (SPACE/BACK/single char),
+    with the same stitched timing as Data TXT when this option is on.
+
+  Does not apply to Uniform Typing Mode (Word file), which has no raw
+  backspace stream.
+
+  How to use: Check to enable.
+
+Add random fake backspaces (video length increases; final text unchanged)
+  What it does: After the normal typing timeline is built, inserts random
+  bursts of synthetic backspace keystrokes (with matching durations), each
+  burst followed by re-typing the same characters that were deleted so the
+  final text is identical to the recording. This lengthens the video (more
+  frames) without changing the ending text. The expected number of bursts
+  scales with video length and “Approx. bursts / minute” (Poisson-distributed
+  mean ≈ rate × duration in minutes). Each burst deletes 1–5 characters from
+  the end of the text at a random frame (after at least one character exists),
+  then restores them. Each fake backspace uses a random duration in a range
+  derived from Word Typing Speed (so bursts feel less uniform). After the last
+  fake backspace, a random pause holds the same text (no new keys), then each
+  retyped character also uses a random duration in a similar range.
+  How to use: Check to enable; set bursts per minute (e.g. 2.0). Applies to
+  XML/Word, Data TXT, IDFX, and Uniform Typing Mode.
 
 
 MOVING WINDOW
@@ -161,23 +208,59 @@ Space Duration (s)
 VIDEO TIMING CONTROLS
 
 Enable Video Timing Controls
-  What it does: Lets you trim the video to a specific time range or
-  percentage of the original.
+  What it does: Lets you trim the output to a time range on the typing
+  timeline, or keep a percentage of the remaining length.
   How to use: Check to enable. Options below become active.
 
+How timing works (both modes)
+  Inputs use milliseconds on the full session timeline. The program builds
+  that timeline by adding up each frame duration (seconds per keystroke
+  frame), then cuts which logical frames to render and adjusts any frame at
+  the start or end that is only partly inside the range.
+  Export uses a fixed output framerate (20 fps). Start and end are snapped
+  to the nearest step of one output frame (0.05 s) so cuts line up with how
+  the video file is built.
+
 Start Time (ms) / End Time (ms)
-  What it does: (Absolute mode) Start and end of the output video in
-  milliseconds. Only frames in this range are included.
-  How to use: Enter milliseconds (e.g. 1000 = 1 second).
+  What it does: (Absolute mode) Where the output clip starts and stops on
+  the timeline, in milliseconds from the beginning.
+  How to use: Enter milliseconds (e.g. 1000 = 1 second). End Time 0 means
+  run to the end of the recording.
 
 Duration (%)
-  What it does: (Percentage mode) Percentage of the video to keep from
-  the start time.
-  How to use: Enter 1 to 100 (e.g. 50 = first half).
+  What it does: (Percentage mode) Percentage of the remaining time after
+  the start offset. Not a frame count: it is the share of remaining duration
+  on the timeline (e.g. 50 = half of the time left after Start Time).
+  How to use: Enter 1 to 100.
 
 Absolute Time vs Percentage
-  Absolute: Use Start/End times in milliseconds.
-  Percentage: Use Start time plus Duration % of the remaining length.
+  Absolute: Set Start Time and End Time in ms. End 0 = to end of clip.
+  Percentage: Set Start Time in ms (where to begin), then Duration % of the
+  time that remains after that point.
+
+Trim start/end on word boundaries (with timing trim)
+  What it does: After the usual timing window is computed (absolute or
+  percentage), adjusts the clip so it starts at the first frame that begins
+  a new word on or after the nominal start, and ends at the last frame that
+  completes a word on or before the nominal end (typically after a space or
+  at the end of the text).
+  How to use: Check when Enable Video Timing Controls is on. Only affects
+  output when timing trim is active.
+
+Trim start/end on sentence boundaries (with timing trim)
+  What it does: After the nominal timing window is computed (absolute or
+  percentage), moves the start to the beginning of the sentence closest to
+  the nominal start: the first character of the file, or the first character
+  typed after a sentence-ending . ! ? (ignoring trailing spaces), or the
+  first character on a new line after Enter. Moves the end to the closest
+  sentence end at or before the nominal end: the frame where the text ends
+  with . ! ? (after trimming spaces). If the session has no . ! ? anywhere,
+  it uses the frame just before a line break (Enter). If there are no line
+  breaks, it uses the same “end of word” rule as word boundary trim. If
+  both this option and word boundary trim are on, sentence boundaries take
+  precedence.
+  How to use: Check when Enable Video Timing Controls is on. Only affects
+  output when timing trim is active (same as word boundary trim).
 
 
 OPTIONS

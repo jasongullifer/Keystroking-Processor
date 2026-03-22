@@ -12,9 +12,339 @@ import tempfile
 import threading
 import sys
 import json
-import queue
-import time
 import ijson
+import math
+import random
+from itertools import accumulate
+
+# Output video framerate used in save_video; time trims snap to this grid when timing controls are on.
+VIDEO_OUTPUT_FPS = 20
+_PROGRAM_DIR = os.path.dirname(os.path.abspath(__file__))
+_SETTINGS_JSON = os.path.join(_PROGRAM_DIR, 'xml-to-text-settings.json')
+
+# Main settings panel: smooth scroll uses yview_moveto (Canvas yview_scroll has no "pixels" mode).
+_MAIN_SCROLL_PIXELS_PER_WHEEL_NOTCH = 52.0  # one typical mouse notch (delta ±120 on Windows)
+_MAIN_SCROLL_MAC_DELTA_TO_PIXELS = 9.0  # Tk delta on macOS is small integers per gesture
+_MAIN_SCROLL_LINUX_BUTTON_PIXELS = 40.0  # Button-4/5 one "click"
+
+
+def _batch_upload_subdir_name():
+    return f"BATCH UPLOAD {datetime.now().strftime('%Y-%m-%d %H-%M-%S')}"
+
+
+def _frame_starts_new_word(text_states, i):
+    """First character of a word: after whitespace or at document start."""
+    if i < 0 or i >= len(text_states):
+        return False
+    if i == 0:
+        return True
+    prev, t = text_states[i - 1], text_states[i]
+    if len(t) < len(prev):
+        return False
+    if len(t) != len(prev) + 1:
+        return False
+    c = t[-1]
+    if c.isspace():
+        return False
+    return not prev or prev[-1].isspace()
+
+
+def _frame_at_word_end_boundary(text_states, i, n):
+    """After a word delimiter, or last frame of the session."""
+    t = text_states[i]
+    if not t:
+        return True
+    if t[-1].isspace():
+        return True
+    return i >= n - 1
+
+
+def _text_ends_with_sentence_closer(s):
+    """Text ends with sentence-ending punctuation (ignores trailing whitespace)."""
+    s = (s or "").rstrip()
+    return bool(s) and s[-1] in ".!?"
+
+
+def _document_has_sentence_punctuation(text_states):
+    return any(any(c in t for c in ".!?") for t in text_states)
+
+
+def _document_has_newline(text_states):
+    return any("\n" in t for t in text_states)
+
+
+def _frame_starts_sentence(text_states, i):
+    """First character of input, first char after . ! ? (ignoring trailing ws), or first char of a new line."""
+    if i < 0 or i >= len(text_states):
+        return False
+    cur = text_states[i]
+    if not cur:
+        return False
+    if i == 0:
+        return True
+    prev = text_states[i - 1]
+    if len(cur) != len(prev) + 1:
+        return False
+    new_ch = cur[-1]
+    if new_ch.isspace():
+        return False
+    pst = prev.rstrip()
+    if pst and pst[-1] in ".!?":
+        return True
+    if prev and prev[-1] == "\n":
+        return True
+    return False
+
+
+def _frame_immediately_before_newline(text_states, j, n):
+    """Frame j is the line content right before Enter adds a newline."""
+    if j < 0 or j + 1 >= n:
+        return False
+    prev, nxt = text_states[j], text_states[j + 1]
+    if len(nxt) != len(prev) + 1:
+        return False
+    return nxt[-1] == "\n" and not prev.endswith("\n")
+
+
+def _xml_output_is_stackable(o):
+    """Keyboard outputs that change text in XML mode (SPACE or single character)."""
+    if o is None:
+        return False
+    if o == "SPACE":
+        return True
+    return isinstance(o, str) and len(o) == 1
+
+
+def _data_event_is_stackable(event):
+    """Events that change text in data.txt / IDFX mode (same rules as reconstruct)."""
+    o = event.get("output")
+    if not isinstance(o, str):
+        return False
+    if o.lower() == "backspace":
+        return False
+    if o in ("space", "enter"):
+        return True
+    return len(o) == 1
+
+
+def filter_events_remove_backspace_edits(events, event_format="data"):
+    """
+    Remove backspace key events and any typing events that were undone by backspace,
+    so the video only shows the surviving text (e.g. type 's', backspace, type 'a' -> only 'a').
+    Non-stackable pass-through events (e.g. odd XML keys) are kept in order.
+    event_format: 'xml' (SPACE, BACK, single char) or 'data' (space, enter, backspace, single char).
+    """
+    if not events:
+        return []
+    result = []
+    stack = []
+    for event in events:
+        o = event.get("output")
+        if event_format == "xml":
+            if o == "BACK":
+                if stack:
+                    stack.pop()
+                    for i in range(len(result) - 1, -1, -1):
+                        if _xml_output_is_stackable(result[i].get("output")):
+                            del result[i]
+                            break
+                continue
+            if _xml_output_is_stackable(o):
+                stack.append(event)
+            result.append(event)
+        else:
+            if isinstance(o, str) and o.lower() == "backspace":
+                if stack:
+                    stack.pop()
+                    for i in range(len(result) - 1, -1, -1):
+                        if _data_event_is_stackable(result[i]):
+                            del result[i]
+                            break
+                continue
+            if _data_event_is_stackable(event):
+                stack.append(event)
+            result.append(event)
+    return result
+
+
+def filter_idfx_strip_backspace_blocks_and_preceding_keys(events):
+    """
+    IDFX-specific backspace cleanup when "Hide backspace edits" is on.
+
+    For each contiguous run of backspace events:
+      1) Remove the entire backspace run.
+      2) Let K = number of backspaces in that run.
+      3) Remove the K text-producing (stackable) key events immediately before that
+         run in the timeline (walking backward, skipping non-stackable events).
+
+    Repeat until no backspaces remain.
+
+    Example: S, A, BS, BS, F, A, C, E  ->  F, A, C, E
+    (two backspaces removed; two stackable keys before them — S and A — removed.)
+    """
+    if not events:
+        return []
+    # Work on shallow copies so callers' lists are not mutated
+    result = [{"output": e.get("output"), "start_time": e.get("start_time")} for e in events]
+    while True:
+        first_bs = None
+        for i, e in enumerate(result):
+            o = e.get("output")
+            if isinstance(o, str) and o.lower() == "backspace":
+                first_bs = i
+                break
+        if first_bs is None:
+            break
+        start_bs = first_bs
+        end_bs = start_bs
+        while end_bs + 1 < len(result):
+            o = result[end_bs + 1].get("output")
+            if isinstance(o, str) and o.lower() == "backspace":
+                end_bs += 1
+            else:
+                break
+        k_bs = end_bs - start_bs + 1
+        remove = set(range(start_bs, end_bs + 1))
+        need = k_bs
+        pos = start_bs - 1
+        while pos >= 0 and need > 0:
+            if _data_event_is_stackable(result[pos]):
+                remove.add(pos)
+                need -= 1
+            pos -= 1
+        for idx in sorted(remove, reverse=True):
+            del result[idx]
+    return result
+
+
+def stitch_frame_times_after_backspace_strip(events, settings, event_format="data"):
+    """
+    When backspace stripping removed events, recompute per-frame durations using only
+    gaps between consecutive *surviving* events (no time from session start to first
+    survivor — that gap was "typing" deleted content). Same word/space overrides and
+    video_speed as reconstruct_*.
+    events: list aligned with one frame each (data: valid_events; xml: ev).
+    """
+    if not events:
+        return []
+    n = len(events)
+    frame_times = []
+    for i in range(n):
+        if i == 0:
+            frame_times.append(0.05)  # placeholder; overrides below set word/space
+        else:
+            prev_t = events[i - 1]["start_time"] / 1000.0
+            cur_t = events[i]["start_time"] / 1000.0
+            frame_times.append(max(0.05, cur_t - prev_t))
+    word_speed = settings["word_speed"]
+    space_duration = settings["space_duration"]
+    for i, event in enumerate(events):
+        output = event["output"]
+        if event_format == "xml":
+            if output == "SPACE":
+                frame_times[i] = space_duration
+            elif output and len(output) == 1:
+                if i == 0 or events[i - 1]["output"] == "SPACE":
+                    frame_times[i] = word_speed
+        else:
+            if output == "space":
+                frame_times[i] = space_duration
+            elif output and isinstance(output, str) and len(output) == 1:
+                if i == 0 or events[i - 1]["output"] == "space":
+                    frame_times[i] = word_speed
+    speed_mult = settings["video_speed"]
+    return [ft / speed_mult for ft in frame_times]
+
+
+def _poisson_sample(lam):
+    """Knuth's algorithm; mean lam."""
+    if lam <= 0:
+        return 0
+    L = math.exp(-lam)
+    k = 0
+    p = 1.0
+    while p > L:
+        k += 1
+        p *= random.random()
+    return k - 1
+
+
+def inject_fake_backspaces_into_timeline(text_states, frame_times, settings):
+    """
+    Insert random bursts of fake backspaces followed by re-typing the deleted
+    characters so the final text is unchanged but the video gains extra frames.
+    settings: fake_backspace_enabled, fake_backspaces_per_minute, word_speed, video_speed.
+    """
+    if not settings.get("fake_backspace_enabled", False):
+        return text_states, frame_times
+    if not text_states or not frame_times or len(text_states) != len(frame_times):
+        return text_states, frame_times
+    ts = list(text_states)
+    ft = list(frame_times)
+    total_duration = sum(ft)
+    if total_duration <= 0:
+        return text_states, frame_times
+    rate = float(settings.get("fake_backspaces_per_minute", 2.0))
+    rate = max(0.0, rate)
+    duration_min = total_duration / 60.0
+    n_inject = _poisson_sample(rate * duration_min)
+    if n_inject <= 0:
+        return text_states, frame_times
+    word_speed = float(settings.get("word_speed", 0.15))
+    speed_mult = float(settings.get("video_speed", 1.0))
+    if speed_mult <= 0:
+        speed_mult = 1.0
+    # Random duration ranges (seconds, after video_speed divide)
+    bs_lo = max(0.05, word_speed * 0.3) / speed_mult
+    bs_hi = max(0.08, word_speed * 1.5) / speed_mult
+    if bs_hi <= bs_lo:
+        bs_hi = bs_lo + 0.03
+    pause_lo = max(0.05, word_speed * 0.3) / speed_mult
+    pause_hi = max(0.12, word_speed * 3.0) / speed_mult
+    if pause_hi <= pause_lo:
+        pause_hi = pause_lo + 0.05
+    char_lo = max(0.05, word_speed * 0.5) / speed_mult
+    char_hi = max(0.08, word_speed * 1.8) / speed_mult
+    if char_hi <= char_lo:
+        char_hi = char_lo + 0.03
+
+    valid = [i for i in range(len(ts)) if ts[i]]
+    if not valid:
+        return text_states, frame_times
+    n_inject = min(n_inject, len(valid))
+    after_indices = random.sample(valid, n_inject)
+    injections = []
+    for after_idx in after_indices:
+        text = ts[after_idx]
+        max_k = min(5, len(text))
+        if max_k < 1:
+            continue
+        k = random.randint(1, max_k)
+        chars_del = text[-k:]
+        block_states = []
+        block_times = []
+        cur = text
+        for _ in range(k):
+            cur = cur[:-1]
+            block_states.append(cur)
+            block_times.append(random.uniform(bs_lo, bs_hi))
+        # Random pause (same text frozen) before retyping deleted characters
+        pre_pause = random.uniform(pause_lo, pause_hi)
+        block_states.append(cur)
+        block_times.append(pre_pause)
+        for ch in chars_del:
+            cur = cur + ch
+            block_states.append(cur)
+            block_times.append(random.uniform(char_lo, char_hi))
+        injections.append((after_idx, block_states, block_times))
+    if not injections:
+        return text_states, frame_times
+    injections.sort(key=lambda x: -x[0])
+    for after_idx, block_states, block_times in injections:
+        ts[after_idx + 1 : after_idx + 1] = block_states
+        ft[after_idx + 1 : after_idx + 1] = block_times
+    return ts, ft
+
 
 class XMLToVideoApp:
     def __init__(self, root):
@@ -28,9 +358,172 @@ class XMLToVideoApp:
         self.create_widgets()
 
     def create_widgets(self):
-        # Create main frame (single page)
-        self.main_frame = tk.Frame(self.root)
-        self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # Scrollable main area (vertical + horizontal) so all settings stay reachable on small windows
+        scroll_outer = tk.Frame(self.root)
+        scroll_outer.pack(fill="both", expand=True, padx=10, pady=10)
+        scroll_outer.grid_rowconfigure(0, weight=1)
+        scroll_outer.grid_columnconfigure(0, weight=1)
+
+        self._scroll_canvas = tk.Canvas(scroll_outer, highlightthickness=0)
+        vsb = tk.Scrollbar(scroll_outer, orient="vertical", command=self._scroll_canvas.yview)
+        hsb = tk.Scrollbar(scroll_outer, orient="horizontal", command=self._scroll_canvas.xview)
+        self._scroll_canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self._scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        corner = tk.Frame(scroll_outer)
+        corner.grid(row=1, column=1)
+
+        self.main_frame = tk.Frame(self._scroll_canvas)
+        self._canvas_window = self._scroll_canvas.create_window((0, 0), window=self.main_frame, anchor="nw")
+
+        def _update_scrollregion():
+            bbox = self._scroll_canvas.bbox("all")
+            if bbox:
+                self._scroll_canvas.configure(scrollregion=bbox)
+
+        def _sync_canvas_inner_width():
+            """Inner width = max(viewport, requested) so narrow windows still fill; wide content can scroll horizontally."""
+            self._scroll_canvas.update_idletasks()
+            cw = self._scroll_canvas.winfo_width()
+            if cw <= 1:
+                return
+            try:
+                reqw = self.main_frame.winfo_reqwidth()
+            except tk.TclError:
+                reqw = cw
+            w = max(cw, reqw)
+            self._scroll_canvas.itemconfig(self._canvas_window, width=w)
+
+        def _on_main_configure(event):
+            _sync_canvas_inner_width()
+            _update_scrollregion()
+
+        def _on_canvas_configure(event):
+            _sync_canvas_inner_width()
+            _update_scrollregion()
+
+        self.main_frame.bind("<Configure>", _on_main_configure)
+        self._scroll_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _wheel_should_scroll(event):
+            w = event.widget
+            while w is not None:
+                if isinstance(w, (tk.Listbox, tk.Entry, tk.Text, ttk.Entry, ttk.Combobox)):
+                    return False
+                if w == self.main_frame:
+                    return True
+                w = w.master
+            return False
+
+        def _apply_main_scroll_pixel_motion(motion_px):
+            """Smooth pixel-style scroll via yview_moveto (Canvas has no yview_scroll 'pixels').
+            motion_px > 0 = scroll down (show content below)."""
+            if motion_px == 0:
+                return
+            canvas = self._scroll_canvas
+            canvas.update_idletasks()
+            sr = canvas.cget("scrollregion")
+            if not sr:
+                return
+            parts = sr.split()
+            if len(parts) != 4:
+                return
+            _x1, y1, _x2, y2 = map(float, parts)
+            H = y2 - y1
+            if H <= 1.0:
+                return
+            V = float(canvas.winfo_height())
+            if V >= H - 1.0:
+                return
+            top, _ = canvas.yview()
+            new_top = top + (motion_px / H)
+            max_top = max(0.0, 1.0 - (V / H))
+            new_top = max(0.0, min(max_top, new_top))
+            canvas.yview_moveto(new_top)
+
+        def _apply_main_scroll_horizontal_motion(motion_px):
+            """motion_px > 0 = scroll right (show content to the right of the viewport)."""
+            if motion_px == 0:
+                return
+            canvas = self._scroll_canvas
+            canvas.update_idletasks()
+            sr = canvas.cget("scrollregion")
+            if not sr:
+                return
+            parts = sr.split()
+            if len(parts) != 4:
+                return
+            x1, _, x2, _ = map(float, parts)
+            W = x2 - x1
+            if W <= 1.0:
+                return
+            Cw = float(canvas.winfo_width())
+            if Cw >= W - 1.0:
+                return
+            left, _ = canvas.xview()
+            new_left = left + (motion_px / W)
+            max_left = max(0.0, 1.0 - (Cw / W))
+            new_left = max(0.0, min(max_left, new_left))
+            canvas.xview_moveto(new_left)
+
+        def _wheel_motion_from_delta(d):
+            if sys.platform == "darwin":
+                if abs(d) >= 120:
+                    return (-float(d) / 120.0) * _MAIN_SCROLL_PIXELS_PER_WHEEL_NOTCH
+                return -float(d) * _MAIN_SCROLL_MAC_DELTA_TO_PIXELS
+            return (-float(d) / 120.0) * _MAIN_SCROLL_PIXELS_PER_WHEEL_NOTCH
+
+        def _event_has_shift(event):
+            """Shift + wheel → horizontal scroll (same convention as many apps)."""
+            s = getattr(event, "state", 0) or 0
+            return bool(s & 0x0001)
+
+        def _on_mousewheel(event):
+            if not _wheel_should_scroll(event):
+                return
+            d = getattr(event, "delta", 0)
+            if d == 0:
+                return
+            motion = _wheel_motion_from_delta(d)
+            if _event_has_shift(event):
+                _apply_main_scroll_horizontal_motion(motion)
+            else:
+                _apply_main_scroll_pixel_motion(motion)
+
+        def _on_mousewheel_linux_up(event):
+            if not _wheel_should_scroll(event):
+                return
+            _apply_main_scroll_pixel_motion(-_MAIN_SCROLL_LINUX_BUTTON_PIXELS)
+
+        def _on_mousewheel_linux_down(event):
+            if not _wheel_should_scroll(event):
+                return
+            _apply_main_scroll_pixel_motion(_MAIN_SCROLL_LINUX_BUTTON_PIXELS)
+
+        def _on_mousewheel_linux_left(event):
+            if not _wheel_should_scroll(event):
+                return
+            _apply_main_scroll_horizontal_motion(-_MAIN_SCROLL_LINUX_BUTTON_PIXELS)
+
+        def _on_mousewheel_linux_right(event):
+            if not _wheel_should_scroll(event):
+                return
+            _apply_main_scroll_horizontal_motion(_MAIN_SCROLL_LINUX_BUTTON_PIXELS)
+
+        self.root.bind_all("<MouseWheel>", _on_mousewheel)
+        self.root.bind_all("<Button-4>", _on_mousewheel_linux_up)
+        self.root.bind_all("<Button-5>", _on_mousewheel_linux_down)
+        # X11 horizontal wheel (Linux). macOS Aqua Tk rejects Button-6/7 at bind time.
+        for _seq, _fn in (
+            ("<Button-6>", _on_mousewheel_linux_left),
+            ("<Button-7>", _on_mousewheel_linux_right),
+        ):
+            try:
+                self.root.bind_all(_seq, _fn)
+            except tk.TclError:
+                pass
 
         # File type selector dropdown
         file_type_frame = tk.Frame(self.main_frame)
@@ -203,6 +696,28 @@ class XMLToVideoApp:
         self.show_caret_check = tk.Checkbutton(font_frame, text="Show caret", variable=self.show_caret_var)
         self.show_caret_check.grid(row=1, column=2, padx=5)
 
+        self.strip_backspace_edits_var = tk.BooleanVar(value=False)
+        self.strip_backspace_edits_check = tk.Checkbutton(
+            font_frame,
+            text="Hide backspace edits (video shows only surviving text; no deleted keystrokes)",
+            variable=self.strip_backspace_edits_var,
+        )
+        self.strip_backspace_edits_check.grid(row=2, column=0, columnspan=6, sticky="w", padx=5, pady=(2, 0))
+
+        fake_row = tk.Frame(font_frame)
+        fake_row.grid(row=3, column=0, columnspan=6, sticky="w", padx=5, pady=(4, 0))
+        self.fake_backspace_enabled_var = tk.BooleanVar(value=False)
+        self.fake_backspace_check = tk.Checkbutton(
+            fake_row,
+            text="Add random fake backspaces (video length increases; final text unchanged)",
+            variable=self.fake_backspace_enabled_var,
+        )
+        self.fake_backspace_check.pack(side="left", padx=(0, 8))
+        tk.Label(fake_row, text="Approx. bursts / minute:").pack(side="left", padx=5)
+        self.fake_backspaces_per_minute_var = tk.DoubleVar(value=2.0)
+        self.fake_backspaces_per_minute_entry = tk.Entry(fake_row, textvariable=self.fake_backspaces_per_minute_var, width=6)
+        self.fake_backspaces_per_minute_entry.pack(side="left", padx=5)
+
         window_frame = tk.LabelFrame(self.main_frame, text="Moving Window")
         window_frame.pack(pady=5, fill="x", padx=10)
         self.moving_window_var = tk.BooleanVar(value=False)
@@ -285,6 +800,22 @@ class XMLToVideoApp:
         tk.Radiobutton(timing_mode_frame, text="Percentage", variable=self.timing_mode_var, 
                       value="percentage", command=self.update_timing_mode).pack(side="left", padx=5)
 
+        self.word_boundary_trim_var = tk.BooleanVar(value=False)
+        self.word_boundary_trim_check = tk.Checkbutton(
+            timing_frame,
+            text="Trim start/end on word boundaries (with timing trim)",
+            variable=self.word_boundary_trim_var,
+        )
+        self.word_boundary_trim_check.grid(row=3, column=0, columnspan=6, sticky="w", padx=5, pady=2)
+
+        self.sentence_boundary_trim_var = tk.BooleanVar(value=False)
+        self.sentence_boundary_trim_check = tk.Checkbutton(
+            timing_frame,
+            text="Trim start/end on sentence boundaries (with timing trim)",
+            variable=self.sentence_boundary_trim_var,
+        )
+        self.sentence_boundary_trim_check.grid(row=4, column=0, columnspan=6, sticky="w", padx=5, pady=2)
+
         options_frame = tk.Frame(self.main_frame)
         options_frame.pack(pady=5, fill="x", padx=10)
         self.save_video_var = tk.BooleanVar(value=True)
@@ -304,6 +835,7 @@ class XMLToVideoApp:
 
         # Load settings if available
         self.load_settings()
+        self.update_timing_controls()
 
         # Apply file-type layout (ensures correct layout on first boot)
         self.on_file_type_change()
@@ -439,6 +971,73 @@ class XMLToVideoApp:
         else:
             self.batch_generate_idfx_btn.config(state=tk.DISABLED)
 
+    # Batch UI must run on the Tk main thread (worker thread + messagebox/widgets is unsafe and can raise).
+    def _batch_xml_finish_success(self, output_folder, n_files):
+        self.xml_status_label.config(
+            text=f"Batch processing complete! Videos saved to {output_folder}", fg="green"
+        )
+        messagebox.showinfo(
+            "Complete",
+            f"Processed {n_files} files. Videos saved to {output_folder}",
+        )
+        self.processing = False
+        self.batch_generate_btn.config(state=tk.NORMAL)
+        self.progress_xml.pack_forget()
+        self.xml_status_label.config(text="")
+
+    def _batch_xml_finish_error(self, err):
+        error_msg = f"Batch processing failed: {err}"
+        self.xml_status_label.config(text=error_msg, fg="red")
+        messagebox.showerror("Error", error_msg)
+        self.processing = False
+        self.batch_generate_btn.config(state=tk.NORMAL)
+        self.progress_xml.pack_forget()
+        self.xml_status_label.config(text="")
+
+    def _batch_data_finish_success(self, output_folder, n_files):
+        self.data_status_label.config(
+            text=f"Batch processing complete! Videos saved to {output_folder}", fg="green"
+        )
+        messagebox.showinfo(
+            "Complete",
+            f"Processed {n_files} files. Videos saved to {output_folder}",
+        )
+        self.processing = False
+        self.batch_generate_data_btn.config(state=tk.NORMAL)
+        self.progress_data.pack_forget()
+        self.data_status_label.config(text="")
+
+    def _batch_data_finish_error(self, err):
+        error_msg = f"Batch processing failed: {err}"
+        self.data_status_label.config(text=error_msg, fg="red")
+        messagebox.showerror("Error", error_msg)
+        self.processing = False
+        self.batch_generate_data_btn.config(state=tk.NORMAL)
+        self.progress_data.pack_forget()
+        self.data_status_label.config(text="")
+
+    def _batch_idfx_finish_success(self, output_folder, n_files):
+        self.idfx_status_label.config(
+            text=f"Batch processing complete! Videos saved to {output_folder}", fg="green"
+        )
+        messagebox.showinfo(
+            "Complete",
+            f"Processed {n_files} files. Videos saved to {output_folder}",
+        )
+        self.processing = False
+        self.batch_generate_idfx_btn.config(state=tk.NORMAL)
+        self.progress_idfx.pack_forget()
+        self.idfx_status_label.config(text="")
+
+    def _batch_idfx_finish_error(self, err):
+        error_msg = f"Batch processing failed: {err}"
+        self.idfx_status_label.config(text=error_msg, fg="red")
+        messagebox.showerror("Error", error_msg)
+        self.processing = False
+        self.batch_generate_idfx_btn.config(state=tk.NORMAL)
+        self.progress_idfx.pack_forget()
+        self.idfx_status_label.config(text="")
+
     def process_xml_queue(self):
         if not self.xml_queue:
             messagebox.showwarning("Warning", "No files in queue")
@@ -456,11 +1055,9 @@ class XMLToVideoApp:
         def process_queue():
             try:
                 # Create output folder (timestamped batch subfolder only when 2+ files)
-                program_dir = os.path.dirname(os.path.abspath(__file__))
-                base_output = os.path.join(program_dir, 'xml-to-text-video-output')
+                base_output = os.path.join(_PROGRAM_DIR, 'xml-to-text-video-output')
                 if len(self.xml_queue) > 1:
-                    batch_folder_name = f"BATCH UPLOAD {datetime.now().strftime('%Y-%m-%d %H-%M-%S')}"
-                    output_folder = os.path.join(base_output, batch_folder_name)
+                    output_folder = os.path.join(base_output, _batch_upload_subdir_name())
                 else:
                     output_folder = base_output
                 os.makedirs(output_folder, exist_ok=True)
@@ -470,10 +1067,14 @@ class XMLToVideoApp:
                         xml_path = item['xml_path']
                         word_path = item['word_path']
                         
-                        # Update status
+                        # Update status (main thread only)
                         filename = os.path.basename(xml_path)
-                        self.xml_status_label.config(text=f"Processing: {filename}", fg="blue")
-                        self.root.update_idletasks()
+                        self.root.after(
+                            0,
+                            lambda fn=filename: self.xml_status_label.config(
+                                text=f"Processing: {fn}", fg="blue"
+                            ),
+                        )
                         
                         # Simulate individual processing by temporarily setting the paths
                         original_xml_path = self.xml_path
@@ -486,12 +1087,8 @@ class XMLToVideoApp:
                         events = self.parse_xml_events(xml_path)
                         settings = self.get_settings()
                         
-                        # Load settings from file (if exists) and use for video generation
-                        # Load settings from program directory
-                        program_dir = os.path.dirname(os.path.abspath(__file__))
-                        settings_path = os.path.join(program_dir, 'xml-to-text-settings.json')
-                        if os.path.exists(settings_path):
-                            with open(settings_path, 'r') as f:
+                        if os.path.exists(_SETTINGS_JSON):
+                            with open(_SETTINGS_JSON, 'r') as f:
                                 settings = json.load(f)
                         else:
                             settings = self.get_settings()
@@ -505,7 +1102,7 @@ class XMLToVideoApp:
                         bold = settings["bold"]
                         
                         # Generate frames with font settings from JSON
-                        frames = self.generate_frames(
+                        frames, frame_times = self.generate_frames(
                             text_states, frame_times, font_family, font_size, bold,
                             settings.get("moving_window", False),
                             settings.get("window_size", 10),
@@ -519,7 +1116,9 @@ class XMLToVideoApp:
                             self.end_time_var.get(),
                             self.duration_percent_var.get(),
                             self.timing_mode_var.get(),
-                            settings.get("show_caret", True)
+                            settings.get("show_caret", True),
+                            word_boundary_trim=settings.get("word_boundary_trim", False),
+                            sentence_boundary_trim=settings.get("sentence_boundary_trim", False),
                         )
                         
                         # Assemble video
@@ -533,28 +1132,27 @@ class XMLToVideoApp:
                         self.xml_path = original_xml_path
                         self.word_path = original_word_path
                         
-                        # Update progress
-                        self.progress_xml.config(value=i + 1)
-                        self.root.update_idletasks()
+                        # Update progress (main thread only)
+                        self.root.after(0, lambda v=i + 1: self.progress_xml.config(value=v))
                         
                     except Exception as e:
                         error_msg = f"Failed to process {os.path.basename(xml_path)}: {str(e)}"
                         print(f"DEBUG: {error_msg}")
-                        messagebox.showerror("Error", error_msg)
+                        self.root.after(
+                            0,
+                            lambda msg=error_msg: messagebox.showerror("Error", msg),
+                        )
                 
-                self.xml_status_label.config(text=f"Batch processing complete! Videos saved to {output_folder}", fg="green")
-                messagebox.showinfo("Complete", f"Processed {len(self.xml_queue)} files. Videos saved to {output_folder}")
+                n_done = len(self.xml_queue)
+                self.root.after(
+                    0,
+                    lambda of=output_folder, n=n_done: self._batch_xml_finish_success(of, n),
+                )
                 
             except Exception as e:
-                error_msg = f"Batch processing failed: {str(e)}"
-                print(f"DEBUG: {error_msg}")
-                self.xml_status_label.config(text=error_msg, fg="red")
-                messagebox.showerror("Error", error_msg)
-            finally:
-                self.processing = False
-                self.batch_generate_btn.config(state=tk.NORMAL)
-                self.progress_xml.pack_forget()
-                self.xml_status_label.config(text="")
+                err = str(e)
+                print(f"DEBUG: Batch processing failed: {err}")
+                self.root.after(0, lambda e=err: self._batch_xml_finish_error(e))
         
         threading.Thread(target=process_queue, daemon=True).start()
 
@@ -574,12 +1172,9 @@ class XMLToVideoApp:
         
         def process_queue():
             try:
-                # Create output folder (timestamped batch subfolder only when 2+ files)
-                program_dir = os.path.dirname(os.path.abspath(__file__))
-                base_output = os.path.join(program_dir, 'xml-to-text-video-output')
+                base_output = os.path.join(_PROGRAM_DIR, 'xml-to-text-video-output')
                 if len(self.data_queue) > 1:
-                    batch_folder_name = f"BATCH UPLOAD {datetime.now().strftime('%Y-%m-%d %H-%M-%S')}"
-                    output_folder = os.path.join(base_output, batch_folder_name)
+                    output_folder = os.path.join(base_output, _batch_upload_subdir_name())
                 else:
                     output_folder = base_output
                 os.makedirs(output_folder, exist_ok=True)
@@ -588,10 +1183,14 @@ class XMLToVideoApp:
                     try:
                         data_path = item['data_path']
                         
-                        # Update status
+                        # Update status (main thread only)
                         filename = os.path.basename(data_path)
-                        self.data_status_label.config(text=f"Processing: {filename}", fg="blue")
-                        self.root.update_idletasks()
+                        self.root.after(
+                            0,
+                            lambda fn=filename: self.data_status_label.config(
+                                text=f"Processing: {fn}", fg="blue"
+                            ),
+                        )
                         
                         # Simulate individual processing by temporarily setting the path
                         original_data_path = getattr(self, 'data_txt_path', None)
@@ -601,12 +1200,8 @@ class XMLToVideoApp:
                         events = self.parse_data_txt_events(data_path)
                         settings = self.get_settings()
                         
-                        # Load settings from file (if exists) and use for video generation
-                        # Load settings from program directory
-                        program_dir = os.path.dirname(os.path.abspath(__file__))
-                        settings_path = os.path.join(program_dir, 'xml-to-text-settings.json')
-                        if os.path.exists(settings_path):
-                            with open(settings_path, 'r') as f:
+                        if os.path.exists(_SETTINGS_JSON):
+                            with open(_SETTINGS_JSON, 'r') as f:
                                 settings = json.load(f)
                         else:
                             settings = self.get_settings()
@@ -622,7 +1217,7 @@ class XMLToVideoApp:
                         bold = settings["bold"]
                         
                         # Generate frames with font settings from JSON
-                        frames = self.generate_frames(
+                        frames, frame_times = self.generate_frames(
                             text_states, frame_times, font_family, font_size, bold,
                             settings.get("moving_window", False),
                             settings.get("window_size", 10),
@@ -636,7 +1231,9 @@ class XMLToVideoApp:
                             self.end_time_var.get(),
                             self.duration_percent_var.get(),
                             self.timing_mode_var.get(),
-                            settings.get("show_caret", True)
+                            settings.get("show_caret", True),
+                            word_boundary_trim=settings.get("word_boundary_trim", False),
+                            sentence_boundary_trim=settings.get("sentence_boundary_trim", False),
                         )
                         
                         # Save video
@@ -648,28 +1245,27 @@ class XMLToVideoApp:
                         # Restore original path
                         self.data_txt_path = original_data_path
                         
-                        # Update progress
-                        self.progress_data.config(value=i + 1)
-                        self.root.update_idletasks()
+                        # Update progress (main thread only)
+                        self.root.after(0, lambda v=i + 1: self.progress_data.config(value=v))
                         
                     except Exception as e:
                         error_msg = f"Failed to process {os.path.basename(data_path)}: {str(e)}"
                         print(f"DEBUG: {error_msg}")
-                        messagebox.showerror("Error", error_msg)
+                        self.root.after(
+                            0,
+                            lambda msg=error_msg: messagebox.showerror("Error", msg),
+                        )
                 
-                self.data_status_label.config(text=f"Batch processing complete! Videos saved to {output_folder}", fg="green")
-                messagebox.showinfo("Complete", f"Processed {len(self.data_queue)} files. Videos saved to {output_folder}")
+                n_done = len(self.data_queue)
+                self.root.after(
+                    0,
+                    lambda of=output_folder, n=n_done: self._batch_data_finish_success(of, n),
+                )
                 
             except Exception as e:
-                error_msg = f"Batch processing failed: {str(e)}"
-                print(f"DEBUG: {error_msg}")
-                self.data_status_label.config(text=error_msg, fg="red")
-                messagebox.showerror("Error", error_msg)
-            finally:
-                self.processing = False
-                self.batch_generate_data_btn.config(state=tk.NORMAL)
-                self.progress_data.pack_forget()
-                self.data_status_label.config(text="")
+                err = str(e)
+                print(f"DEBUG: Batch processing failed: {err}")
+                self.root.after(0, lambda e=err: self._batch_data_finish_error(e))
         
         threading.Thread(target=process_queue, daemon=True).start()
 
@@ -686,12 +1282,9 @@ class XMLToVideoApp:
         self.progress_idfx.config(maximum=len(self.idfx_queue), value=0)
         def process_queue():
             try:
-                # Create output folder (timestamped batch subfolder only when 2+ files)
-                program_dir = os.path.dirname(os.path.abspath(__file__))
-                base_output = os.path.join(program_dir, 'xml-to-text-video-output')
+                base_output = os.path.join(_PROGRAM_DIR, 'xml-to-text-video-output')
                 if len(self.idfx_queue) > 1:
-                    batch_folder_name = f"BATCH UPLOAD {datetime.now().strftime('%Y-%m-%d %H-%M-%S')}"
-                    output_folder = os.path.join(base_output, batch_folder_name)
+                    output_folder = os.path.join(base_output, _batch_upload_subdir_name())
                 else:
                     output_folder = base_output
                 os.makedirs(output_folder, exist_ok=True)
@@ -699,8 +1292,12 @@ class XMLToVideoApp:
                     try:
                         idfx_path = item['idfx_path']
                         filename = os.path.basename(idfx_path)
-                        self.idfx_status_label.config(text=f"Processing: {filename}", fg="blue")
-                        self.root.update_idletasks()
+                        self.root.after(
+                            0,
+                            lambda fn=filename: self.idfx_status_label.config(
+                                text=f"Processing: {fn}", fg="blue"
+                            ),
+                        )
                         events = self.parse_idfx_events(idfx_path)
                         settings = self.get_settings()
                         text_states, frame_times = self.reconstruct_idfx_text_states(events, settings)
@@ -709,7 +1306,7 @@ class XMLToVideoApp:
                         font_family = settings["font_family"]
                         font_size = settings["font_size"]
                         bold = settings["bold"]
-                        frames = self.generate_frames(
+                        frames, frame_times = self.generate_frames(
                             text_states, frame_times, font_family, font_size, bold,
                             settings.get("moving_window", False),
                             settings.get("window_size", 10),
@@ -723,30 +1320,31 @@ class XMLToVideoApp:
                             self.end_time_var.get(),
                             self.duration_percent_var.get(),
                             self.timing_mode_var.get(),
-                            settings.get("show_caret", True)
+                            settings.get("show_caret", True),
+                            word_boundary_trim=settings.get("word_boundary_trim", False),
+                            sentence_boundary_trim=settings.get("sentence_boundary_trim", False),
                         )
                         idfx_filename = os.path.splitext(os.path.basename(idfx_path))[0]
                         output_path = os.path.join(output_folder, f'{idfx_filename}_idfx.mp4')
                         self.save_video(frames, frame_times, output_path)
                         self.export_settings_to_csv(settings, output_path)
-                        self.progress_idfx.config(value=i + 1)
-                        self.root.update_idletasks()
+                        self.root.after(0, lambda v=i + 1: self.progress_idfx.config(value=v))
                     except Exception as e:
                         error_msg = f"Failed to process {os.path.basename(idfx_path)}: {str(e)}"
                         print(f"DEBUG: {error_msg}")
-                        messagebox.showerror("Error", error_msg)
-                self.idfx_status_label.config(text=f"Batch processing complete! Videos saved to {output_folder}", fg="green")
-                messagebox.showinfo("Complete", f"Processed {len(self.idfx_queue)} files. Videos saved to {output_folder}")
+                        self.root.after(
+                            0,
+                            lambda msg=error_msg: messagebox.showerror("Error", msg),
+                        )
+                n_done = len(self.idfx_queue)
+                self.root.after(
+                    0,
+                    lambda of=output_folder, n=n_done: self._batch_idfx_finish_success(of, n),
+                )
             except Exception as e:
-                error_msg = f"Batch processing failed: {str(e)}"
-                print(f"DEBUG: {error_msg}")
-                self.idfx_status_label.config(text=error_msg, fg="red")
-                messagebox.showerror("Error", error_msg)
-            finally:
-                self.processing = False
-                self.batch_generate_idfx_btn.config(state=tk.NORMAL)
-                self.progress_idfx.pack_forget()
-                self.idfx_status_label.config(text="")
+                err = str(e)
+                print(f"DEBUG: Batch processing failed: {err}")
+                self.root.after(0, lambda e=err: self._batch_idfx_finish_error(e))
         threading.Thread(target=process_queue, daemon=True).start()
 
     def check_ready(self):
@@ -770,12 +1368,8 @@ class XMLToVideoApp:
         try:
             # Parse XML and reconstruct typing sequence
             events = self.parse_xml_events(self.xml_path)
-            # Load settings from file (if exists) and use for video generation
-            # Load settings from program directory
-            program_dir = os.path.dirname(os.path.abspath(__file__))
-            settings_path = os.path.join(program_dir, 'xml-to-text-settings.json')
-            if os.path.exists(settings_path):
-                with open(settings_path, 'r') as f:
+            if os.path.exists(_SETTINGS_JSON):
+                with open(_SETTINGS_JSON, 'r') as f:
                     settings = json.load(f)
             else:
                 settings = self.get_settings()
@@ -786,7 +1380,7 @@ class XMLToVideoApp:
             font_size = settings["font_size"]
             bold = settings["bold"]
             # Generate frames with font settings from JSON
-            frames = self.generate_frames(
+            frames, frame_times = self.generate_frames(
                 text_states, frame_times, font_family, font_size, bold,
                 settings.get("moving_window", False),
                 settings.get("window_size", 10),
@@ -800,13 +1394,13 @@ class XMLToVideoApp:
                 self.end_time_var.get(),
                 self.duration_percent_var.get(),
                 self.timing_mode_var.get(),
-                settings.get("show_caret", True)
+                settings.get("show_caret", True),
+                word_boundary_trim=settings.get("word_boundary_trim", False),
+                sentence_boundary_trim=settings.get("sentence_boundary_trim", False),
             )
             # Assemble video
             if settings["save_video"]:
-                # Create output folder in the program directory
-                program_dir = os.path.dirname(os.path.abspath(__file__))
-                output_folder = os.path.join(program_dir, 'xml-to-text-video-output')
+                output_folder = os.path.join(_PROGRAM_DIR, 'xml-to-text-video-output')
                 os.makedirs(output_folder, exist_ok=True)
                 xml_filename = os.path.splitext(os.path.basename(self.xml_path))[0]
                 output_path = os.path.join(output_folder, f'{xml_filename}.mp4')
@@ -857,7 +1451,7 @@ class XMLToVideoApp:
                 print("[DEBUG] Generating frames...")
                 def update_progress(current, total):
                     self.data_status_label.config(text=f"Generating frames: {current}/{total}", fg="blue")
-                frames = self.generate_frames(
+                frames, frame_times = self.generate_frames(
                     text_states, frame_times, font_family, font_size, bold,
                     settings.get("moving_window", False),
                     settings.get("window_size", 10),
@@ -871,13 +1465,13 @@ class XMLToVideoApp:
                     end_time=self.end_time_var.get(),
                     duration_percent=self.duration_percent_var.get(),
                     timing_mode=self.timing_mode_var.get(),
-                    show_caret=settings.get("show_caret", True)
+                    show_caret=settings.get("show_caret", True),
+                    word_boundary_trim=settings.get("word_boundary_trim", False),
+                    sentence_boundary_trim=settings.get("sentence_boundary_trim", False),
                 )
                 print(f"[DEBUG] Generated {len(frames)} frames.")
                 self.data_status_label.config(text=f"Generated {len(frames)} frames. Saving video...", fg="blue")
-                # Create output folder in the program directory
-                program_dir = os.path.dirname(os.path.abspath(__file__))
-                output_folder = os.path.join(program_dir, 'xml-to-text-video-output')
+                output_folder = os.path.join(_PROGRAM_DIR, 'xml-to-text-video-output')
                 os.makedirs(output_folder, exist_ok=True)
                 data_filename = os.path.splitext(os.path.basename(self.data_txt_path))[0]
                 output_path = os.path.join(output_folder, f'{data_filename}_data.mp4')
@@ -924,7 +1518,7 @@ class XMLToVideoApp:
                 bold = settings["bold"]
                 def update_progress(current, total):
                     self.idfx_status_label.config(text=f"Generating frames: {current}/{total}", fg="blue")
-                frames = self.generate_frames(
+                frames, frame_times = self.generate_frames(
                     text_states, frame_times, font_family, font_size, bold,
                     settings.get("moving_window", False),
                     settings.get("window_size", 10),
@@ -938,11 +1532,11 @@ class XMLToVideoApp:
                     end_time=self.end_time_var.get(),
                     duration_percent=self.duration_percent_var.get(),
                     timing_mode=self.timing_mode_var.get(),
-                    show_caret=settings.get("show_caret", True)
+                    show_caret=settings.get("show_caret", True),
+                    word_boundary_trim=settings.get("word_boundary_trim", False),
+                    sentence_boundary_trim=settings.get("sentence_boundary_trim", False),
                 )
-                # Create output folder in the program directory
-                program_dir = os.path.dirname(os.path.abspath(__file__))
-                output_folder = os.path.join(program_dir, 'xml-to-text-video-output')
+                output_folder = os.path.join(_PROGRAM_DIR, 'xml-to-text-video-output')
                 os.makedirs(output_folder, exist_ok=True)
                 idfx_filename = os.path.splitext(os.path.basename(self.idfx_path))[0]
                 output_path = os.path.join(output_folder, f'{idfx_filename}_idfx.mp4')
@@ -992,12 +1586,16 @@ class XMLToVideoApp:
             # Apply video speed multiplier
             speed_mult = settings["video_speed"]
             frame_times = [ft / speed_mult for ft in frame_times]
+            text_states, frame_times = inject_fake_backspaces_into_timeline(text_states, frame_times, settings)
             return text_states, frame_times
+        ev = events
+        if settings.get("strip_backspace_edits", False):
+            ev = filter_events_remove_backspace_edits(events, "xml")
         text = ""
         text_states = []
         frame_times = []
         last_time = 0
-        for event in events:
+        for event in ev:
             output = event['output']
             t = event['start_time'] / 1000.0  # ms to seconds
             if output == "SPACE":
@@ -1010,20 +1608,25 @@ class XMLToVideoApp:
             text_states.append(text)
             frame_times.append(max(t - last_time, 0.05))  # at least 0.05s per frame
             last_time = t
-        # Adjust frame_times for word/space speed overrides
-        word_speed = settings["word_speed"]
-        space_duration = settings["space_duration"]
-        for i, event in enumerate(events):
-            output = event['output']
-            if output == "SPACE":
-                frame_times[i] = space_duration
-            elif output and len(output) == 1:
-                # Only set for the first char of a word (after a space or at start)
-                if i == 0 or events[i-1]['output'] == "SPACE":
-                    frame_times[i] = word_speed
-        # Apply video speed multiplier
-        speed_mult = settings["video_speed"]
-        frame_times = [ft / speed_mult for ft in frame_times]
+        if settings.get("strip_backspace_edits", False):
+            # Do not count time before first survivor or between removed keys; stitch survivor deltas only
+            frame_times = stitch_frame_times_after_backspace_strip(ev, settings, event_format="xml")
+        else:
+            # Adjust frame_times for word/space speed overrides
+            word_speed = settings["word_speed"]
+            space_duration = settings["space_duration"]
+            for i, event in enumerate(ev):
+                output = event['output']
+                if output == "SPACE":
+                    frame_times[i] = space_duration
+                elif output and len(output) == 1:
+                    # Only set for the first char of a word (after a space or at start)
+                    if i == 0 or ev[i - 1]['output'] == "SPACE":
+                        frame_times[i] = word_speed
+            # Apply video speed multiplier
+            speed_mult = settings["video_speed"]
+            frame_times = [ft / speed_mult for ft in frame_times]
+        text_states, frame_times = inject_fake_backspaces_into_timeline(text_states, frame_times, settings)
         return text_states, frame_times
 
     def parse_data_txt_events(self, data_txt_path):
@@ -1111,13 +1714,16 @@ class XMLToVideoApp:
             return []
         return events
 
-    def reconstruct_data_txt_text_states(self, events, settings):
+    def reconstruct_data_txt_text_states(self, events, settings, apply_data_strip_filter=True):
+        ev = events
+        if apply_data_strip_filter and settings.get("strip_backspace_edits", False):
+            ev = filter_events_remove_backspace_edits(events, "data")
         text = ""
         text_states = []
         frame_times = []
         last_time = 0
         valid_events = []
-        for event in events:
+        for event in ev:
             output = event['output']
             t = event['start_time'] / 1000.0  # ms to seconds
             if output == "space":
@@ -1134,23 +1740,34 @@ class XMLToVideoApp:
             frame_times.append(max(t - last_time, 0.05))
             last_time = t
             valid_events.append(event)
-        # Adjust frame_times for word/space speed overrides
-        word_speed = settings["word_speed"]
-        space_duration = settings["space_duration"]
-        for i, event in enumerate(valid_events):
-            output = event['output']
-            if output == "space":
-                frame_times[i] = space_duration
-            elif output and isinstance(output, str) and len(output) == 1:
-                if i == 0 or valid_events[i-1]['output'] == "space":
-                    frame_times[i] = word_speed
-        speed_mult = settings["video_speed"]
-        frame_times = [ft / speed_mult for ft in frame_times]
+        if settings.get("strip_backspace_edits", False):
+            # Survivor-only deltas: removed keys/backspaces must not add duration
+            frame_times = stitch_frame_times_after_backspace_strip(
+                valid_events, settings, event_format="data"
+            )
+        else:
+            # Adjust frame_times for word/space speed overrides
+            word_speed = settings["word_speed"]
+            space_duration = settings["space_duration"]
+            for i, event in enumerate(valid_events):
+                output = event['output']
+                if output == "space":
+                    frame_times[i] = space_duration
+                elif output and isinstance(output, str) and len(output) == 1:
+                    if i == 0 or valid_events[i - 1]['output'] == "space":
+                        frame_times[i] = word_speed
+            speed_mult = settings["video_speed"]
+            frame_times = [ft / speed_mult for ft in frame_times]
+        text_states, frame_times = inject_fake_backspaces_into_timeline(text_states, frame_times, settings)
         return text_states, frame_times
 
     def reconstruct_idfx_text_states(self, events, settings):
-        # Reuse the same logic as data.txt events (normalized outputs)
-        return self.reconstruct_data_txt_text_states(events, settings)
+        """Build text timeline from IDFX events. Uses block-based backspace stripping when enabled."""
+        ev = events
+        if settings.get("strip_backspace_edits", False):
+            ev = filter_idfx_strip_backspace_blocks_and_preceding_keys(events)
+        # Do not apply legacy stack-based strip; IDFX already used filter_idfx_strip_backspace_blocks_and_preceding_keys
+        return self.reconstruct_data_txt_text_states(ev, settings, apply_data_strip_filter=False)
 
     def _try_load_font_with_matplotlib(self, font_family, font_size, bold, font_manager):
         """Try to load font using matplotlib font manager"""
@@ -1237,7 +1854,154 @@ class XMLToVideoApp:
             pass
         return None
 
-    def generate_frames(self, text_states, frame_times, font_family=None, font_size=None, bold=None, moving_window=False, window_size=10, window_wordonly=False, mask_narrow="_", mask_wide="#", margin=20, progress_callback=None, enable_timing=False, start_time=0, end_time=0, duration_percent=100.0, timing_mode="absolute", show_caret=True):
+    def apply_video_time_controls(
+        self,
+        text_states,
+        frame_times,
+        enable_timing,
+        start_time_ms,
+        end_time_ms,
+        duration_percent,
+        timing_mode,
+        output_fps=VIDEO_OUTPUT_FPS,
+        word_boundary_trim=False,
+        sentence_boundary_trim=False,
+    ):
+        # Cumulative timeline (s per frame); trims snap to 1/output_fps (matches save_video expansion).
+        if not enable_timing or not text_states or not frame_times:
+            return text_states, frame_times
+        if len(text_states) != len(frame_times):
+            return text_states, frame_times
+
+        n = len(frame_times)
+        cum_start = [0.0] + list(accumulate(frame_times[:-1]))
+        _of = max(1, output_fps)
+
+        def snap_down(t):
+            return round(t * _of) / _of
+
+        total_duration = cum_start[-1] + frame_times[-1]
+
+        if timing_mode == "absolute":
+            start_s = snap_down(max(0.0, start_time_ms * 0.001))
+            if end_time_ms > 0:
+                end_raw = min(total_duration, end_time_ms * 0.001)
+                end_s = snap_down(end_raw)
+                # snap_down can round small positives to 0 (e.g. 0.01s at 20fps); keep a valid window
+                if end_s <= start_s and total_duration > start_s:
+                    end_s = end_raw
+            else:
+                end_s = total_duration
+            if end_s <= start_s:
+                return [], []
+        else:
+            start_s = snap_down(max(0.0, start_time_ms * 0.001))
+            if start_s >= total_duration:
+                return [], []
+            keep_dur = snap_down(0.0 if (duration_percent == 0) else max(
+                0.0, (total_duration - start_s) * (float(duration_percent) * 0.01)))
+            end_s = min(total_duration, start_s + keep_dur)
+            if end_s <= start_s:
+                return [], []
+
+        # Plain timing trim (before boundary snapping); used as fallback if snap yields no frames
+        time_trim_start_s, time_trim_end_s = start_s, end_s
+
+        if sentence_boundary_trim:
+            cum_end = [cum_start[i] + frame_times[i] for i in range(n)]
+            i0 = next((i for i in range(n) if cum_end[i] > start_s), None)
+            if i0 is None:
+                return [], []
+            i_start = next((i for i in range(i0, n) if _frame_starts_sentence(text_states, i)), None)
+            if i_start is None:
+                i_start = i0
+            start_s = cum_start[i_start]
+
+            doc_has_period = _document_has_sentence_punctuation(text_states)
+            doc_has_nl = _document_has_newline(text_states)
+
+            j_end = None
+            if doc_has_period:
+                for j in range(n - 1, -1, -1):
+                    if cum_end[j] > end_s:
+                        continue
+                    if _text_ends_with_sentence_closer(text_states[j]):
+                        j_end = j
+                        break
+            if j_end is None and not doc_has_period and doc_has_nl:
+                for j in range(n - 1, -1, -1):
+                    if cum_end[j] > end_s:
+                        continue
+                    if _frame_immediately_before_newline(text_states, j, n):
+                        j_end = j
+                        break
+            if j_end is None:
+                for j in range(n - 1, -1, -1):
+                    if cum_end[j] > end_s:
+                        continue
+                    if _frame_at_word_end_boundary(text_states, j, n):
+                        j_end = j
+                        break
+            if j_end is None:
+                for j in range(n - 1, -1, -1):
+                    if cum_end[j] <= end_s:
+                        j_end = j
+                        break
+                if j_end is None:
+                    return [], []
+            end_s = cum_end[j_end]
+            if end_s <= start_s:
+                return [], []
+        elif word_boundary_trim:
+            cum_end = [cum_start[i] + frame_times[i] for i in range(n)]
+            i0 = next((i for i in range(n) if cum_end[i] > start_s), None)
+            if i0 is None:
+                return [], []
+            i_start = next((i for i in range(i0, n) if _frame_starts_new_word(text_states, i)), None)
+            # Trim can start mid-word: there may be no "new word" frame at/after i0 — use first visible frame
+            if i_start is None:
+                i_start = i0
+            start_s = cum_start[i_start]
+            j_end = None
+            for j in range(n - 1, -1, -1):
+                if cum_end[j] > end_s:
+                    continue
+                if _frame_at_word_end_boundary(text_states, j, n):
+                    j_end = j
+                    break
+            if j_end is None:
+                for j in range(n - 1, -1, -1):
+                    if cum_end[j] <= end_s:
+                        j_end = j
+                        break
+                if j_end is None:
+                    return [], []
+            end_s = cum_end[j_end]
+            if end_s <= start_s:
+                return [], []
+
+        def _collect_trim_segments(t0, t1):
+            """Collect overlapping frame segments for [t0, t1) on the timeline."""
+            out_s, out_t = [], []
+            app_s, app_t = out_s.append, out_t.append
+            for i in range(n):
+                seg_left = cum_start[i]
+                seg_right = seg_left + frame_times[i]
+                a = seg_left if seg_left > t0 else t0
+                b = seg_right if seg_right < t1 else t1
+                if b > a + 1e-12:
+                    app_t(b - a)
+                    app_s(text_states[i])
+            return out_s, out_t
+
+        out_states, out_times = _collect_trim_segments(start_s, end_s)
+        # Boundary snap can make start/end incompatible with any frame overlap; fall back to plain timing trim
+        if not out_states and n > 0 and (word_boundary_trim or sentence_boundary_trim):
+            out_states, out_times = _collect_trim_segments(time_trim_start_s, time_trim_end_s)
+
+        return out_states, out_times
+
+    def generate_frames(self, text_states, frame_times, font_family=None, font_size=None, bold=None, moving_window=False, window_size=10, window_wordonly=False, mask_narrow="_", mask_wide="#", margin=20, progress_callback=None, enable_timing=False, start_time=0, end_time=0, duration_percent=100.0, timing_mode="absolute", show_caret=True, word_boundary_trim=False, sentence_boundary_trim=False):
         from PIL import ImageFont, Image, ImageDraw
         try:
             from matplotlib import font_manager
@@ -1309,70 +2073,20 @@ class XMLToVideoApp:
         last_text = None
         blink_time = 0.0
         
-        # Apply timing controls if enabled
-        if enable_timing:
-            original_frame_count = len(text_states)
-            original_duration = frame_times[-1] if frame_times else 0
-            
-            if timing_mode == "absolute":
-                # Filter by absolute start and end times
-                start_idx = 0
-                end_idx = len(text_states)
-                
-                # Find start index
-                for i, time in enumerate(frame_times):
-                    if time >= start_time:
-                        start_idx = i
-                        break
-                
-                # Find end index (only if end_time > 0, otherwise use all frames from start)
-                if end_time > 0 and end_time > start_time:
-                    for i, time in enumerate(frame_times):
-                        if time >= end_time:
-                            end_idx = i
-                            break
-                
-                # Apply filtering
-                text_states = text_states[start_idx:end_idx]
-                frame_times = frame_times[start_idx:end_idx]
-                
-                # Adjust frame_times to start from 0 (relative to start_time)
-                if len(frame_times) > 0 and frame_times[0] > 0:
-                    offset = frame_times[0]
-                    frame_times = [t - offset for t in frame_times]
-                
-            elif timing_mode == "percentage":
-                # Take the first X% of frames
-                total_frames = len(text_states)
-                
-                # Apply start time offset if specified
-                start_idx = 0
-                if start_time > 0:
-                    # Find start index based on start_time
-                    for i, time in enumerate(frame_times):
-                        if time >= start_time:
-                            start_idx = i
-                            break
-                
-                # Calculate how many frames to keep from start_idx
-                # duration_percent is the percentage of the remaining frames to keep
-                remaining_frames = total_frames - start_idx
-                frames_to_keep = max(1, int(remaining_frames * (duration_percent / 100.0)))
-                end_idx = start_idx + frames_to_keep
-                
-                # Ensure we don't go beyond the array
-                end_idx = min(end_idx, total_frames)
-                
-                # Apply filtering - take frames from start_idx to end_idx
-                text_states = text_states[start_idx:end_idx]
-                frame_times = frame_times[start_idx:end_idx]
-                
-                # Adjust frame_times to start from 0 (relative to start_time)
-                # This ensures the video duration is correct and starts at time 0
-                if len(frame_times) > 0 and frame_times[0] > 0:
-                    offset = frame_times[0]
-                    frame_times = [t - offset for t in frame_times]
-        
+        # Apply timing controls: cumulative timeline (seconds) + output FPS grid
+        text_states, frame_times = self.apply_video_time_controls(
+            text_states,
+            frame_times,
+            enable_timing,
+            int(start_time),
+            int(end_time),
+            float(duration_percent),
+            timing_mode,
+            output_fps=VIDEO_OUTPUT_FPS,
+            word_boundary_trim=word_boundary_trim,
+            sentence_boundary_trim=sentence_boundary_trim,
+        )
+
         for idx, text in enumerate(text_states):
             # Layout constants - use the margin parameter
             # Wrap text within the visible frame accounting for left+right margins
@@ -1554,7 +2268,7 @@ class XMLToVideoApp:
                 blink_time += frame_times[idx]
             if progress_callback and idx % 100 == 0:
                 progress_callback(idx, len(text_states))
-        return frames
+        return frames, frame_times
 
     def wrap_text(self, text, font, max_width):
         # Handle both explicit newlines and word wrapping
@@ -1588,6 +2302,10 @@ class XMLToVideoApp:
         return lines
 
     def save_video(self, frames, frame_times, output_path):
+        if not frames or not frame_times or len(frames) != len(frame_times):
+            raise ValueError(
+                "No video frames to save. If timing controls are enabled, start/end times may exclude all content."
+            )
         # Convert PIL images to numpy arrays
         import numpy as np
         frame_arrays = [np.array(f) for f in frames]
@@ -1598,8 +2316,8 @@ class XMLToVideoApp:
         clips = []
         for arr, dur in zip(frame_arrays, durations):
             clips.append((arr, dur))
-        # Flatten to frames at 20 fps
-        fps = 20
+        # Flatten to frames at output FPS (must match apply_video_time_controls / VIDEO_OUTPUT_FPS)
+        fps = VIDEO_OUTPUT_FPS
         video_frames = []
         for arr, dur in clips:
             count = max(1, int(round(dur * fps)))
@@ -1617,7 +2335,7 @@ class XMLToVideoApp:
                 font_family = self.font_family_var.get()
                 font_size = self.font_size_var.get()
                 bold = self.bold_var.get()
-                frames = self.generate_frames(
+                frames, frame_times = self.generate_frames(
                     text_states, frame_times, font_family, font_size, bold,
                     self.moving_window_var.get(),
                     self.window_size_var.get(),
@@ -1631,7 +2349,9 @@ class XMLToVideoApp:
                     self.end_time_var.get(),
                     self.duration_percent_var.get(),
                     self.timing_mode_var.get(),
-                    show_caret=self.show_caret_var.get()
+                    show_caret=self.show_caret_var.get(),
+                    word_boundary_trim=self.word_boundary_trim_var.get(),
+                    sentence_boundary_trim=self.sentence_boundary_trim_var.get(),
                 )
                 # Save to a temporary file
                 with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmpfile:
@@ -1669,7 +2389,12 @@ class XMLToVideoApp:
             "start_time": self.start_time_var.get(),
             "end_time": self.end_time_var.get(),
             "duration_percent": self.duration_percent_var.get(),
-            "timing_mode": self.timing_mode_var.get()
+            "timing_mode": self.timing_mode_var.get(),
+            "word_boundary_trim": self.word_boundary_trim_var.get(),
+            "sentence_boundary_trim": self.sentence_boundary_trim_var.get(),
+            "strip_backspace_edits": self.strip_backspace_edits_var.get(),
+            "fake_backspace_enabled": self.fake_backspace_enabled_var.get(),
+            "fake_backspaces_per_minute": self.fake_backspaces_per_minute_var.get(),
         }
 
     def set_settings(self, settings):
@@ -1694,6 +2419,11 @@ class XMLToVideoApp:
         self.end_time_var.set(settings.get("end_time", 0))
         self.duration_percent_var.set(settings.get("duration_percent", 100.0))
         self.timing_mode_var.set(settings.get("timing_mode", "absolute"))
+        self.word_boundary_trim_var.set(settings.get("word_boundary_trim", False))
+        self.sentence_boundary_trim_var.set(settings.get("sentence_boundary_trim", False))
+        self.strip_backspace_edits_var.set(settings.get("strip_backspace_edits", False))
+        self.fake_backspace_enabled_var.set(settings.get("fake_backspace_enabled", False))
+        self.fake_backspaces_per_minute_var.set(settings.get("fake_backspaces_per_minute", 2.0))
         self.update_window_controls()
         self.update_timing_controls()
         self.update_uniform_typing_controls()
@@ -1701,24 +2431,17 @@ class XMLToVideoApp:
     def save_settings(self):
         settings = self.get_settings()
         try:
-            # Save settings in the program directory
-            program_dir = os.path.dirname(os.path.abspath(__file__))
-            settings_path = os.path.join(program_dir, 'xml-to-text-settings.json')
-            with open(settings_path, 'w') as f:
+            with open(_SETTINGS_JSON, 'w') as f:
                 json.dump(settings, f, indent=2)
-            messagebox.showinfo("Settings Saved", f"Settings saved to {settings_path}")
+            messagebox.showinfo("Settings Saved", f"Settings saved to {_SETTINGS_JSON}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save settings: {e}")
 
     def load_settings(self):
         try:
-            # Load settings from program directory
-            program_dir = os.path.dirname(os.path.abspath(__file__))
-            settings_path = os.path.join(program_dir, 'xml-to-text-settings.json')
-            if os.path.exists(settings_path):
-                with open(settings_path, 'r') as f:
-                    settings = json.load(f)
-                self.set_settings(settings)
+            if os.path.exists(_SETTINGS_JSON):
+                with open(_SETTINGS_JSON, 'r') as f:
+                    self.set_settings(json.load(f))
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load settings: {e}")
 
@@ -1794,6 +2517,8 @@ class XMLToVideoApp:
         self.start_time_entry.config(state=state)
         self.end_time_entry.config(state=state)
         self.duration_percent_entry.config(state=state)
+        self.word_boundary_trim_check.config(state=state)
+        self.sentence_boundary_trim_check.config(state=state)
         self.update_timing_mode()
 
     def update_timing_mode(self):

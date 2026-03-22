@@ -1,3 +1,4 @@
+__pycache__/
 .DS_Store
 xml-to-text-settings.json
 xml-to-text-video-output/
