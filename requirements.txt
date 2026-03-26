@@ -1,5 +1,5 @@
 moviepy
 Pillow
 lxml
-# usually included with Python, but listed for clarity
-python-docx 
+python-docx
+ijson

@@ -6,7 +6,7 @@ into video animations that replay the typing process on a blank background.
 **Requirements:**
 This guide will cover the installation of the Python packages, but not Python itself.
 - **Python 3.8** or newer                  
-- **Packages (from `requirements.txt`):** moviepy, Pillow, lxml, python-docx, ijson (recommended)      
+- **Packages (from `requirements.txt`):** moviepy, Pillow, lxml, python-docx, ijson
 
 ---
 
@@ -53,7 +53,14 @@ via "Load Settings from CSV" to save time when reusing the same setup.
 ---
 
 ## HOW TO INSTALL AND RUN THE PROGRAM
-Before beginning, you should have Python 3.8 or newer installed. You can check your version by opening Terminal (Mac, Linux), Command Prompt (Windows) or Powershell (Windows) and running the command `python --version`. 
+Before beginning, you should have Python 3.8 or newer installed. You can check your version by opening Terminal (Mac, Linux) or Command Prompt / PowerShell (Windows) and running:
+
+- **Windows / Linux:** `python --version`
+- **Mac:** `python3 --version`
+
+If Python is not installed, download it from [python.org](https://www.python.org/downloads/) and install it before continuing.
+
+> **Mac users:** On macOS, the command is usually `python3` instead of `python`. Wherever this guide shows `python`, use `python3` instead (e.g. `python3 -m venv myenv`, `python3 keystroking_to_video.py`).
 
 ### INSTALLATION
 
@@ -75,15 +82,19 @@ cd Keystroking-Processor
      
 #### **Step 2: Create a virtual environment**
 
-Once the terminal is running inside the project folder, it is highly suggested to create a Python `virtual environment`. A virtual environment isolates this project's dependencies from your system Python and other projects. 
-
-Note: Depending on your operating system you may be able to proceed without a virtual environment.
+A virtual environment is a self-contained folder that keeps this project's dependencies separate from the rest of your system. It is strongly recommended, and avoids common "it worked on my computer" issues.
 
 In Terminal/Command Prompt, while in the project's folder, run:
+
+- **Windows / Linux:**
 ```bash
 python -m venv myenv
 ```
-(Replace "myenv" with any name you prefer, e.g. "venv".)
+- **Mac:**
+```bash
+python3 -m venv myenv
+```
+(You can replace `myenv` with any name you like, e.g. `venv`.)
 
 #### **Step 3: Activate the virtual environment**
 On macOS/Linux:
@@ -107,23 +118,22 @@ With the virtual environment active:
 ```bash
 pip install -r requirements.txt
 ```
-For full functionality (including large `data.txt` support):
-```bash
-pip install ijson
-```
 
 You are now ready to run the program!
 
 
 ### RUNNING THE PROGRAM
 
-1. Open Terminal (Mac, Linux), Command Prompt (Windows) or Powershell (Windows). Navigate to the program's folder. 
+Each time you want to use the program, repeat these three steps:
 
-- Mac: Type cd  (with a space) in Terminal, then drag the folder from Finder into the Terminal window — it fills in the path automatically. Press `Enter`.
+**1. Open a terminal and navigate to the program's folder**
 
-- Windows: Open the folder in File Explorer, then right-click inside it (Windows 11: "Open in Terminal"; Windows 10: "Open Terminal/PowerShell window here"). 
+- **Mac:** Open Terminal. Type `cd ` (with a space), then drag the program folder from Finder into the Terminal window — it will fill in the path automatically. Press `Enter`.
+- **Windows:** Open the program folder in File Explorer, then right-click inside it and choose "Open in Terminal" (Windows 11) or "Open PowerShell window here" (Windows 10).
 
-2. Activate the virtual environment. Do this any time you open a new terminal and want to run the program. You can tell a virtual environment is activated if you see `(myenv)` prepended before the text in your terminal.
+**2. Activate the virtual environment**
+
+You can tell it is active when you see `(myenv)` at the start of your terminal prompt.
 
 On macOS/Linux:
 ```bash
@@ -139,15 +149,19 @@ On Windows (PowerShell):
 ```powershell
 myenv\Scripts\Activate.ps1
 ```
-After activation, your prompt usually shows `(myenv)` or similar.
 
-3. Run the program
+**3. Run the program**
 
+- **Windows / Linux:**
 ```bash
 python keystroking_to_video.py
 ```
+- **Mac:**
+```bash
+python3 keystroking_to_video.py
+```
 
-To deactivate the virtual environment when finished:
+When you are finished, you can close the terminal or deactivate the virtual environment:
 ```bash
 deactivate
 ```
@@ -442,8 +456,7 @@ stays organized.
 **FILE FORMATS:**
 Ensure XML files follow the expected structure (keyboard events with
 `output` and `startTime`).
-For large `data.txt` files, install ijson (`pip install ijson`) for efficient
-streaming parsing.
+Large `data.txt` files are handled efficiently via `ijson`, which is included in `requirements.txt`.
 
 ---
 
@@ -503,6 +516,6 @@ encoding) run in the background without freezing the interface.
 - **`python-docx` (Document):** Reads Word (`.docx`) files for uniform typing mode.
 - **`Pillow` (PIL):** Creates images, draws text, loads fonts. Used for every frame of the video.
 - **`moviepy` (ImageSequenceClip):** Assembles image frames into an MP4 video.
-- **`ijson` (optional):** Streams through large JSON `data.txt` files without loading everything into memory.
+- **`ijson`:** Streams through large JSON `data.txt` files without loading everything into memory.
 - **`numpy` (via moviepy):** Converts images to arrays for video encoding.
 
